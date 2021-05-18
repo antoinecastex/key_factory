@@ -1,0 +1,215 @@
+main:
+  params: [args]
+  steps:
+  - init:
+      assign:
+        - localProject: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+        - serviceAccountName: ${args.serviceAccountName}
+        - serviceAccountEmail: ${serviceAccountName+"@"+localProject+".iam.gserviceaccount.com"}
+        - IamKeyType: "USER_MANAGED"
+        - event_time: ${sys.now()}
+        - collection: "serviceAccountFactory"
+        - generateUidQuery: "select GENERATE_UUID()"
+        - secretManager_topic: ${args.secretmanager_topic}
+  - logArgs:
+        call: sys.log
+        args:
+            text: ${"The provided args, project:" + localProject + ", serviceAccountName:" + serviceAccountName + ", serviceAccountEmail:" + serviceAccountEmail}
+            severity: "INFO"
+  - getServiceAccount:
+      try:
+        call: http.get
+        args:
+          url: ${"https://iam.googleapis.com/v1/projects/"+localProject+"/serviceAccounts/"+serviceAccountEmail}
+          auth:
+            type: OAuth2
+        result: serviceAccount
+      except:
+        as: e
+        steps:
+            - handledGetSaException:
+                switch:
+                - condition: ${not("HttpError" in e.tags)}
+                  next: connectionProblem
+                - condition: ${e.code == 404}
+                  next: logServiceAccountNotFound
+                - condition: ${e.code == 403}
+                  next: authProblem
+            - UnhandledGetSaException:
+                raise: ${e}
+  - logServiceAccountFound:
+      call: sys.log
+      args:
+          text: ${"Service Account Found"}
+          severity: "INFO"
+      next: createKey
+  - createServiceAccount:
+      try:
+        call: http.post
+        args:
+          url: ${"https://iam.googleapis.com/v1/projects/"+localProject+"/serviceAccounts/"}
+          auth:
+            type: OAuth2
+          body:
+            accountId: ${serviceAccountName}
+        result: serviceAccountNew
+      except:
+        as: e
+        steps:
+            - handledCreateSaException:
+                switch:
+                - condition: ${not("HttpError" in e.tags)}
+                  next: connectionProblem
+                - condition: ${e.code == 404}
+                  next: urlNotFound
+                - condition: ${e.code == 403}
+                  next: authProblem
+            - UnhandledCreateSaException:
+                raise: ${e}
+  - createKey:
+      try:
+        call: http.post
+        args:
+          url: ${"https://iam.googleapis.com/v1/projects/"+localProject+"/serviceAccounts/"+serviceAccountEmail+"/keys"}
+          auth:
+            type: OAuth2
+        result: key
+      except:
+        as: e
+        steps:
+            - handledCreateKeyException:
+                switch:
+                - condition: ${not("HttpError" in e.tags)}
+                  next: connectionProblem
+                - condition: ${e.code == 404}
+                  next: urlNotFound
+                - condition: ${e.code == 403}
+                  next: authProblem
+            - UnhandledCreateKeyException:
+                raise: ${e}
+  - createSecret:
+      try:
+        call: http.post
+        args:
+          url: ${"https://secretmanager.googleapis.com/v1/projects/"+localProject+"/secrets?secretId="+serviceAccountName}
+          auth:
+            type: OAuth2
+          body:
+            replication:
+              automatic: {}
+            topics:
+              name: ${secretManager_topic}
+        result: secret
+      except:
+        as: e
+        steps:
+            - handledCreateSecretException:
+                switch:
+                - condition: ${not("HttpError" in e.tags)}
+                  next: connectionProblem
+                - condition: ${e.code == 404}
+                  next: urlNotFound
+                - condition: ${e.code == 403}
+                  next: authProblem
+                - condition: ${e.code == 409}
+                  next: addSecret
+            - UnhandledCreateSecretException:
+                raise: ${e}
+  - addSecret:
+      try:
+        call: http.post
+        args:
+          url: ${"https://secretmanager.googleapis.com/v1beta1/projects/"+localProject+"/secrets/"+serviceAccountName+":addVersion"}
+          auth:
+            type: OAuth2
+          body:
+            payload:
+              data: ${key.body.privateKeyData}
+        result: newSecret
+      except:
+        as: e
+        steps:
+            - handledAddSecretException:
+                switch:
+                - condition: ${not("HttpError" in e.tags)}
+                  next: connectionProblem
+                - condition: ${e.code == 404}
+                  next: urlNotFound
+                - condition: ${e.code == 403}
+                  next: authProblem
+            - UnhandledAddSecretException:
+                raise: ${e}
+  - generateUid:
+      try:
+        call: http.post
+        args:
+            url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/"+localProject+"/queries"}
+            auth:
+                type: OAuth2
+            body:
+                query: ${generateUidQuery}
+                useLegacySql: False
+        result: job
+      except:
+          as: e
+          steps:
+              - handledGBQQueryException:
+                  switch:
+                  - condition: ${not("HttpError" in e.tags)}
+                    next: connectionProblem
+                  - condition: ${e.code == 404}
+                    next: urlNotFound
+                  - condition: ${e.code == 403}
+                    next: authProblem
+              - UnhandledGBQQueryException:
+                  raise: ${e}
+  - initFirestoreVariables:
+      assign:
+        - document: ${json.encode_to_string(job.body.rows[0].f[0].v)}
+        - valuesToWrite:
+            serviceaccountemail:
+              stringValue: ${serviceAccountEmail}
+            keyname:
+              stringValue: ${key.body.name}
+            secretname:
+              stringValue: ${serviceAccountName}
+            secretversion:
+              stringValue: ${newSecret.body.name}
+            creationdate:
+              timestampValue: ${newSecret.body.createTime}
+            
+  - writeToFirestore:
+      try:
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${"projects/"+localProject+"/databases/(default)/documents/"+collection+"/"+document}
+          body:
+            fields: ${valuesToWrite}
+        result: writeResult
+      except:
+        as: e
+        steps:
+          - handleFirestoreWriteError:
+              switch:
+                - condition: ${e.code == 404}
+                  raise: "Firestore database or document not found"
+                - condition: ${e.code == 403}
+                  raise: "Error authenticating to Firestore"
+          - unhandledException:
+              raise: ${e}
+  - returnOutput:
+      return: ${"gcloud beta secrets versions access latest --secret="+serviceAccountName+" --project="+localProject}
+  - connectionProblem:
+      raise: "Connection problem; check URL"
+  - urlNotFound:
+      raise: "Sorry, URL wasn't found"
+  - authProblem:
+      raise: "Authentication error"
+  - keyExist:
+      raise: "Key Already existe"
+  - logServiceAccountNotFound:
+      call: sys.log
+      args:
+          text: "Service Account Not Founded"
+          severity: "INFO"
+      next: createServiceAccount
