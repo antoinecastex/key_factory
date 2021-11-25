@@ -14,7 +14,7 @@ main:
   - logArgs:
         call: sys.log
         args:
-            text: ${"The provided args, project:" + localProject + ", serviceAccountName:" + serviceAccountName + ", serviceAccountEmail:" + serviceAccountEmail}
+            text: ${"The provideds args, project:" + localProject + ", serviceAccountName:" + serviceAccountName + ", serviceAccountEmail:" + serviceAccountEmail}
             severity: "INFO"
   - getServiceAccount:
       try:
